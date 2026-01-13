@@ -14,69 +14,73 @@
 
 'use strict';
 
+/**
+ * @fileoverview Perfetto UI 与 Chrome 扩展构建脚本
+ * 核心功能：
+ * 1. 处理全量 UI 和 Chrome 扩展的构建流程（生产环境构建为串行执行所有任务）
+ * 2. 启动带热重载的 HTTP 开发服务器
+ * 3. 支持 watch 模式：基于 fs.watch 监听文件变化，联动 tsc --watch 和 rollup --watch 实现增量构建
+ * 设计初衷：
+ * - 手写脚本而非传统构建系统，以保证增量构建速度（编辑-重载周期控制在秒级）
+ * - 兼容支持 --watch 模式的工具（tsc/rollup）和基于 fs.watch 的文件变更触发规则
+ * 构建目录结构：
+ * out/xxx/          (outDir)        - 构建根目录（包含 ninja/wasm 和 UI 产物）
+ *   ui/             (outUiDir)      - UI 专属目录（当前脚本所有输出）
+ *    tsc/           (outTscDir)     - TS 编译为 JS 的产物目录
+ *      gen/         (outGenDir)     - 自动生成的 TS/JS 文件（如 proto 编译产物）
+ *    dist/          (outDistRootDir)- 根目录仅包含 index.html 和 service_worker.js
+ *      v1.2/        (outDistDir)    - JS 打包产物和静态资源
+ *    chrome_extension/              - Chrome 扩展产物
+ */
 
-// This script takes care of:
-// - The build process for the whole UI and the chrome extension.
-// - The HTTP dev-server with live-reload capabilities.
-// The reason why this is a hand-rolled script rather than a conventional build
-// system is keeping incremental build fast and maintaining the set of
-// dependencies contained.
-// The only way to keep incremental build fast (i.e. O(seconds) for the
-// edit-one-line -> reload html cycles) is to run both the TypeScript compiler
-// and the rollup bundler in --watch mode. Any other attempt, leads to O(10s)
-// incremental-build times.
-// This script allows mixing build tools that support --watch mode (tsc and
-// rollup) and auto-triggering-on-file-change rules via fs.watch.
-// When invoked without any argument (e.g., for production builds), this script
-// just runs all the build tasks serially. It doesn't to do any mtime-based
-// check, it always re-runs all the tasks.
-// When invoked with --watch, it mounts a pipeline of tasks based on fs.watch
-// and runs them together with tsc --watch and rollup --watch.
-// The output directory structure is carefully crafted so that any change to UI
-// sources causes cascading triggers of the next steps.
-// The overall build graph looks as follows:
-// +----------------+      +-----------------------------+
-// | protos/*.proto |----->| pbjs out/tsc/gen/protos.js  |--+
-// +----------------+      +-----------------------------+  |
-//                         +-----------------------------+  |
-//                         | pbts out/tsc/gen/protos.d.ts|<-+
-//                         +-----------------------------+
-//                             |
-//                             V      +-------------------------+
-// +---------+              +-----+   |  out/tsc/frontend/*.js  |
-// | ui/*.ts |------------->| tsc |-> +-------------------------+   +--------+
-// +---------+              +-----+   | out/tsc/controller/*.js |-->| rollup |
-//                            ^       +-------------------------+   +--------+
-//                +------------+      |   out/tsc/engine/*.js   |       |
-// +-----------+  |*.wasm.js   |      +-------------------------+       |
-// |ninja *.cc |->|*.wasm.d.ts |                                        |
-// +-----------+  |*.wasm      |-----------------+                      |
-//                +------------+                 |                      |
-//                                               V                      V
-// +-----------+  +------+    +------------------------------------------------+
-// | ui/*.scss |->| scss |--->|              Final out/dist/ dir               |
-// +-----------+  +------+    +------------------------------------------------+
-// +----------------------+   | +----------+ +---------+ +--------------------+|
-// | src/assets/*.png     |   | | assets/  | |*.wasm.js| | frontend_bundle.js ||
-// +----------------------+   | |  *.css   | |*.wasm   | +--------------------+|
-// | buildtools/typefaces |-->| |  *.png   | +---------+ |  engine_bundle.js  ||
-// +----------------------+   | |  *.woff2 |             +--------------------+|
-// | buildtools/legacy_tv |   | |  tv.html |             |traceconv_bundle.js ||
-// +----------------------+   | +----------+             +--------------------+|
-//                            +------------------------------------------------+
+// 引入核心依赖
+const argparse = require('argparse'); // 命令行参数解析
+const childProcess = require('child_process'); // 子进程管理
+const crypto = require('crypto'); // 加密模块（当前未直接使用，预留/潜在依赖）
+const fs = require('fs'); // 文件系统操作
+const http = require('http'); // HTTP 服务器
+const path = require('path'); // 路径处理
+const pjoin = path.join; // 路径拼接快捷方法
 
-const argparse = require('argparse');
-const childProcess = require('child_process');
-const crypto = require('crypto');
-const fs = require('fs');
-const http = require('http');
-const path = require('path');
-const pjoin = path.join;
+/**
+ * 全局常量定义
+ * @constant {string} ROOT_DIR - 代码仓库根目录
+ * @constant {string} VERSION_SCRIPT - 生成版本信息的脚本路径
+ * @constant {string} GEN_IMPORTS_SCRIPT - 生成 UI 导入文件的脚本路径
+ */
+const ROOT_DIR = path.dirname(__dirname);  // 仓库根目录
+const VERSION_SCRIPT = pjoin(ROOT_DIR, 'tools/write_version_header.py'); // 版本信息生成脚本
+const GEN_IMPORTS_SCRIPT = pjoin(ROOT_DIR, 'tools/gen_ui_imports'); // UI 导入文件生成脚本
 
-const ROOT_DIR = path.dirname(__dirname);  // The repo root.
-const VERSION_SCRIPT = pjoin(ROOT_DIR, 'tools/write_version_header.py');
-const GEN_IMPORTS_SCRIPT = pjoin(ROOT_DIR, 'tools/gen_ui_imports');
-
+/**
+ * 全局配置对象
+ * 存储构建相关的所有配置项，包括命令行参数、目录路径、功能开关等
+ * @type {Object}
+ * @property {string} minifyJs - JS 压缩模式：''/preserve_comments/all
+ * @property {boolean} watch - 是否开启 watch 模式（监听文件变化）
+ * @property {boolean} verbose - 是否开启详细日志
+ * @property {boolean} debug - 是否调试模式（影响 wasm 构建等）
+ * @property {boolean} bigtrace - 是否构建 bigtrace 产物
+ * @property {boolean} startHttpServer - 是否启动 HTTP 开发服务器
+ * @property {string} httpServerListenHost - HTTP 服务器监听主机
+ * @property {number} httpServerListenPort - HTTP 服务器监听端口
+ * @property {boolean} onlyWasmMemory64 - 是否仅构建 64 位内存版本的 wasm
+ * @property {string[]} wasmModules - 需要构建的 wasm 模块列表
+ * @property {boolean} crossOriginIsolation - 是否开启跨源隔离
+ * @property {string} testFilter - Jest 测试过滤正则
+ * @property {boolean} noOverrideGnArgs - 是否覆盖 GN 构建参数
+ * @property {string} outDir - 构建根目录
+ * @property {string} version - 版本号（从 CHANGELOG + git 派生）
+ * @property {string} outUiDir - UI 产物根目录
+ * @property {string} outUiTestArtifactsDir - UI 测试产物目录
+ * @property {string} outDistRootDir - dist 根目录（存放 index.html 等）
+ * @property {string} outTscDir - TS 编译产物目录
+ * @property {string} outGenDir - 自动生成文件目录
+ * @property {string} outDistDir - 带版本号的 dist 目录（存放 JS/静态资源）
+ * @property {string} outExtDir - Chrome 扩展产物目录
+ * @property {string} outBigtraceDistDir - bigtrace 专属 dist 目录
+ * @property {string} outOpenPerfettoTraceDistDir - open_perfetto_trace 专属 dist 目录
+ */
 const cfg = {
   minifyJs: '',
   watch: false,
@@ -92,17 +96,9 @@ const cfg = {
   testFilter: '',
   noOverrideGnArgs: false,
 
-  // The fields below will be changed by main() after cmdline parsing.
-  // Directory structure:
-  // out/xxx/    -> outDir         : Root build dir, for both ninja/wasm and UI.
-  //   ui/       -> outUiDir       : UI dir. All outputs from this script.
-  //    tsc/     -> outTscDir      : Transpiled .ts -> .js.
-  //      gen/   -> outGenDir      : Auto-generated .ts/.js (e.g. protos).
-  //    dist/    -> outDistRootDir : Only index.html and service_worker.js
-  //      v1.2/  -> outDistDir     : JS bundles and assets
-  //    chrome_extension/          : Chrome extension.
+  // 以下字段会在 main() 中根据命令行参数更新
   outDir: pjoin(ROOT_DIR, 'out/ui'),
-  version: '',  // v1.2.3, derived from the CHANGELOG + git.
+  version: '',
   outUiDir: '',
   outUiTestArtifactsDir: '',
   outDistRootDir: '',
@@ -114,19 +110,34 @@ const cfg = {
   outOpenPerfettoTraceDistDir: '',
 };
 
+/**
+ * 文件变更规则映射
+ * 键：正则表达式（匹配文件路径）
+ * 值：触发的处理函数
+ * @type {Array<{r: RegExp, f: Function}>}
+ */
 const RULES = [
-  {r: /ui\/src\/assets\/index.html/, f: copyIndexHtml},
-  {r: /ui\/src\/assets\/bigtrace.html/, f: copyBigtraceHtml},
-  {r: /ui\/src\/open_perfetto_trace\/index.html/, f: copyOpenPerfettoTraceHtml},
-  {r: /ui\/src\/assets\/((.*)[.]png)/, f: copyAssets},
-  {r: /buildtools\/typefaces\/(.+[.]woff2)/, f: copyAssets},
-  {r: /buildtools\/catapult_trace_viewer\/(.+(js|html))/, f: copyAssets},
-  {r: /ui\/src\/assets\/.+[.]scss|ui\/src\/(?:plugins|core_plugins)\/.+[.]scss/, f: compileScss},
-  {r: /ui\/src\/chrome_extension\/.*/, f: copyExtensionAssets},
-  {r: /.*\/dist\/.+\/(?!manifest\.json).*/, f: genServiceWorkerManifestJson},
-  {r: /.*\/dist\/.*[.](js|html|css|wasm)$/, f: notifyLiveServer},
+  {r: /ui\/src\/assets\/index.html/, f: copyIndexHtml}, // 复制主页面 HTML
+  {r: /ui\/src\/assets\/bigtrace.html/, f: copyBigtraceHtml}, // 复制 bigtrace 页面 HTML
+  {r: /ui\/src\/open_perfetto_trace\/index.html/, f: copyOpenPerfettoTraceHtml}, // 复制 open_perfetto_trace 页面 HTML
+  {r: /ui\/src\/assets\/((.*)[.]png)/, f: copyAssets}, // 复制 PNG 静态资源
+  {r: /buildtools\/typefaces\/(.+[.]woff2)/, f: copyAssets}, // 复制字体文件
+  {r: /buildtools\/catapult_trace_viewer\/(.+(js|html))/, f: copyAssets}, // 复制 catapult 相关资源
+  {r: /ui\/src\/assets\/.+[.]scss|ui\/src\/(?:plugins|core_plugins)\/.+[.]scss/, f: compileScss}, // 编译 SCSS 为 CSS
+  {r: /ui\/src\/chrome_extension\/.*/, f: copyExtensionAssets}, // 复制 Chrome 扩展资源
+  {r: /.*\/dist\/.+\/(?!manifest\.json).*/, f: genServiceWorkerManifestJson}, // 生成 ServiceWorker 清单
+  {r: /.*\/dist\/.*[.](js|html|css|wasm)$/, f: notifyLiveServer}, // 通知热重载服务器文件变更
 ];
 
+/**
+ * 任务队列相关变量
+ * @type {Array<Function>} tasks - 待执行的构建任务队列
+ * @type {number} tasksTot - 总任务数
+ * @type {number} tasksRan - 已执行任务数
+ * @type {Array<any>} httpWatches - HTTP 服务器监听的文件变更列表
+ * @type {number} tStart - 构建开始时间戳
+ * @type {Array<childProcess.ChildProcess>} subprocesses - 子进程列表（用于退出时清理）
+ */
 const tasks = [];
 let tasksTot = 0;
 let tasksRan = 0;
@@ -134,46 +145,67 @@ const httpWatches = [];
 const tStart = performance.now();
 const subprocesses = [];
 
+/**
+ * 脚本入口函数
+ * 核心流程：
+ * 1. 解析命令行参数
+ * 2. 初始化构建目录
+ * 3. 注册 SIGINT 信号处理（清理子进程）
+ * 4. 检查构建依赖
+ * 5. 入队构建任务（Wasm、TS 编译、资源复制、Proto 编译等）
+ * 6. 等待首次构建完成（watch 模式）
+ * 7. 启动 HTTP 服务器（若指定）
+ * 8. 运行单元测试（若指定）
+ * @async
+ * @returns {Promise<void>}
+ */
 async function main() {
+  // 1. 初始化命令行参数解析器
   const parser = new argparse.ArgumentParser();
-  parser.add_argument('--out', {help: 'Output directory'});
+  parser.add_argument('--out', {help: '输出目录（覆盖默认 out/ui）'});
   parser.add_argument('--minify-js', {
-    help: 'Minify js files',
-    choices: ['preserve_comments', 'all'],
+    help: 'JS 压缩模式',
+    choices: ['preserve_comments', 'all'], // 保留注释 / 全量压缩
   });
-  parser.add_argument('--watch', '-w', {action: 'store_true'});
-  parser.add_argument('--serve', '-s', {action: 'store_true'});
-  parser.add_argument('--serve-host', {help: '--serve bind host'});
-  parser.add_argument('--serve-port', {help: '--serve bind port', type: 'int'});
-  parser.add_argument('--verbose', '-v', {action: 'store_true'});
-  parser.add_argument('--no-build', '-n', {action: 'store_true'});
-  parser.add_argument('--no-wasm', '-W', {action: 'store_true'});
-  parser.add_argument('--only-wasm-memory64', {action: 'store_true'});
-  parser.add_argument('--run-unittests', '-t', {action: 'store_true'});
-  parser.add_argument('--debug', '-d', {action: 'store_true'});
-  parser.add_argument('--bigtrace', {action: 'store_true'});
-  parser.add_argument('--open-perfetto-trace', {action: 'store_true'});
-  parser.add_argument('--interactive', '-i', {action: 'store_true'});
-  parser.add_argument('--rebaseline', '-r', {action: 'store_true'});
-  parser.add_argument('--no-depscheck', {action: 'store_true'});
-  parser.add_argument('--cross-origin-isolation', {action: 'store_true'});
+  parser.add_argument('--watch', '-w', {action: 'store_true', help: '开启 watch 模式（监听文件变化）'});
+  parser.add_argument('--serve', '-s', {action: 'store_true', help: '启动 HTTP 开发服务器'});
+  parser.add_argument('--serve-host', {help: 'HTTP 服务器绑定主机（默认 127.0.0.1）'});
+  parser.add_argument('--serve-port', {help: 'HTTP 服务器绑定端口（默认 10000）', type: 'int'});
+  parser.add_argument('--verbose', '-v', {action: 'store_true', help: '开启详细日志输出'});
+  parser.add_argument('--no-build', '-n', {action: 'store_true', help: '跳过构建流程（仅启动服务器/测试）'});
+  parser.add_argument('--no-wasm', '-W', {action: 'store_true', help: '跳过 Wasm 模块构建'});
+  parser.add_argument('--only-wasm-memory64', {action: 'store_true', help: '仅构建 64 位内存版本的 Wasm'});
+  parser.add_argument('--run-unittests', '-t', {action: 'store_true', help: '运行 Jest 单元测试'});
+  parser.add_argument('--debug', '-d', {action: 'store_true', help: '调试模式（影响 Wasm 构建等）'});
+  parser.add_argument('--bigtrace', {action: 'store_true', help: '构建 bigtrace 专属产物'});
+  parser.add_argument('--open-perfetto-trace', {action: 'store_true', help: '构建 open_perfetto_trace 专属产物'});
+  parser.add_argument('--interactive', '-i', {action: 'store_true', help: '交互式测试模式'});
+  parser.add_argument('--rebaseline', '-r', {action: 'store_true', help: '重新生成测试基准'});
+  parser.add_argument('--no-depscheck', {action: 'store_true', help: '跳过构建依赖检查'});
+  parser.add_argument('--cross-origin-isolation', {action: 'store_true', help: '开启跨源隔离'});
   parser.add_argument('--test-filter', '-f', {
-    help: 'filter Jest tests by regex, e.g. \'chrome_render\'',
+    help: 'Jest 测试过滤正则（如 \'chrome_render\'）',
   });
-  parser.add_argument('--no-override-gn-args', {action: 'store_true'});
+  parser.add_argument('--no-override-gn-args', {action: 'store_true', help: '不覆盖 GN 构建参数'});
 
+  // 解析命令行参数
   const args = parser.parse_args();
-  const clean = !args.no_build;
+  const clean = !args.no_build; // 是否执行清理/全量构建
+  // 2. 初始化构建目录（确保目录存在，clean 模式下清空）
   cfg.outDir = path.resolve(ensureDir(args.out || cfg.outDir));
   cfg.outUiDir = ensureDir(pjoin(cfg.outDir, 'ui'), clean);
   cfg.outUiTestArtifactsDir = ensureDir(pjoin(cfg.outDir, 'ui-test-artifacts'));
   cfg.outExtDir = ensureDir(pjoin(cfg.outUiDir, 'chrome_extension'));
   cfg.outDistRootDir = ensureDir(pjoin(cfg.outUiDir, 'dist'));
+  
+  // 获取版本号（从版本脚本中读取）
   const proc = exec('python3', [VERSION_SCRIPT, '--stdout'], {stdout: 'pipe'});
   cfg.version = proc.stdout.toString().trim();
   cfg.outDistDir = ensureDir(pjoin(cfg.outDistRootDir, cfg.version));
   cfg.outTscDir = ensureDir(pjoin(cfg.outUiDir, 'tsc'));
   cfg.outGenDir = ensureDir(pjoin(cfg.outUiDir, 'tsc/gen'));
+  
+  // 同步命令行参数到全局配置
   cfg.testFilter = args.test_filter || '';
   cfg.watch = !!args.watch;
   cfg.verbose = !!args.verbose;
@@ -185,6 +217,7 @@ async function main() {
   if (args.minify_js) {
     cfg.minifyJs = args.minify_js;
   }
+  // 初始化 bigtrace/open_perfetto_trace 专属目录
   if (args.bigtrace) {
     cfg.outBigtraceDistDir = ensureDir(pjoin(cfg.outDistDir, 'bigtrace'));
   }
@@ -192,42 +225,48 @@ async function main() {
     cfg.outOpenPerfettoTraceDistDir = ensureDir(pjoin(cfg.outDistRootDir,
                                                       'open_perfetto_trace'));
   }
+  // 同步 HTTP 服务器配置
   if (args.serve_host) {
     cfg.httpServerListenHost = args.serve_host;
   }
   if (args.serve_port) {
     cfg.httpServerListenPort = args.serve_port;
   }
+  // 测试相关环境变量
   if (args.interactive) {
     process.env.PERFETTO_UI_TESTS_INTERACTIVE = '1';
   }
   if (args.rebaseline) {
     process.env.PERFETTO_UI_TESTS_REBASELINE = '1';
   }
+  // 跨源隔离配置
   if (args.cross_origin_isolation) {
     cfg.crossOriginIsolation = true;
   }
+  // Wasm 模块配置
   cfg.onlyWasmMemory64 = !!args.only_wasm_memory64;
   cfg.wasmModules = ['traceconv', 'trace_config_utils', 'trace_processor_memory64'];
   if (!cfg.onlyWasmMemory64) {
-    cfg.wasmModules.push('trace_processor');
+    cfg.wasmModules.push('trace_processor'); // 非 64 位模式添加基础 trace_processor
   }
 
+  // 3. 注册 SIGINT 信号处理（Ctrl+C）：清理子进程并退出
   process.on('SIGINT', () => {
     console.log('\nSIGINT received. Killing all child processes and exiting');
     for (const proc of subprocesses) {
       if (proc) proc.kill('SIGKILL');
     }
-    process.kill(0, 'SIGKILL');  // Kill the whole process group.
-    process.exit(130);  // 130 -> Same behavior of bash when killed by SIGINT.
+    process.kill(0, 'SIGKILL');  // 终止整个进程组
+    process.exit(130);  // 与 bash 处理 SIGINT 一致的退出码
   });
 
+  // 4. 检查构建依赖（默认执行）
   if (!args.no_depscheck) {
-    // Check that deps are current before starting.
     const installBuildDeps = pjoin(ROOT_DIR, 'tools/install-build-deps');
     const checkDepsPath = pjoin(cfg.outDir, '.check_deps');
     let args = [installBuildDeps, `--check-only=${checkDepsPath}`, '--ui'];
 
+    // Mac ARM64 架构适配
     if (process.platform === 'darwin') {
       const result = childProcess.spawnSync('arch', ['-arm64', 'true']);
       const isArm64Capable = result.status === 0;
@@ -244,62 +283,64 @@ async function main() {
     exec(cmd, args);
   }
 
+  // 切换工作目录到构建根目录
   console.log('Entering', cfg.outDir);
   process.chdir(cfg.outDir);
 
-  // Enqueue empty task. This is needed only for --no-build --serve. The HTTP
-  // server is started when the task queue reaches quiescence, but it takes at
-  // least one task for that.
+  // 入队空任务（兼容 --no-build --serve 模式：确保任务队列有初始任务）
   addTask(() => {});
 
+  // 5. 入队核心构建任务（非 --no-build 模式）
   if (!args.no_build) {
-    updateSymlinks();  // Links //ui/out -> //out/xxx/ui/
+    updateSymlinks();  // 更新符号链接（ui/out -> out/xxx/ui 等）
 
-    buildWasm(args.no_wasm);
-    generateImports('ui/src/core_plugins', 'all_core_plugins');
-    generateImports('ui/src/plugins', 'all_plugins');
+    buildWasm(args.no_wasm); // 构建 Wasm 模块
+    generateImports('ui/src/core_plugins', 'all_core_plugins'); // 生成核心插件导入文件
+    generateImports('ui/src/plugins', 'all_plugins'); // 生成普通插件导入文件
+    // 扫描静态资源目录并触发对应处理规则
     scanDir('ui/src/assets');
     scanDir('ui/src/plugins', /[.]scss$/);
     scanDir('ui/src/core_plugins', /[.]scss$/);
     scanDir('ui/src/chrome_extension');
     scanDir('buildtools/typefaces');
     scanDir('buildtools/catapult_trace_viewer');
-    compileProtos();
-    genVersion();
-    generateStdlibDocs();
+    compileProtos(); // 编译 Proto 文件为 TS/JS
+    genVersion(); // 生成版本信息 TS 文件
+    generateStdlibDocs(); // 生成 Perfetto SQL 标准库文档
 
+    // TS 项目编译配置
     const tsProjects = [
       'ui',
       'ui/src/service_worker'
     ];
-    if (cfg.bigtrace) tsProjects.push('ui/src/bigtrace');
+    if (cfg.bigtrace) tsProjects.push('ui/src/bigtrace'); // bigtrace 专属 TS 项目
     if (cfg.openPerfettoTrace) {
       scanDir('ui/src/open_perfetto_trace');
-      tsProjects.push('ui/src/open_perfetto_trace');
+      tsProjects.push('ui/src/open_perfetto_trace'); // open_perfetto_trace 专属 TS 项目
     }
 
-
+    // 执行 TS 编译（非 watch 模式）
     for (const prj of tsProjects) {
       transpileTsProject(prj);
     }
 
+    // watch 模式：启动 TS 编译的 watch 进程
     if (cfg.watch) {
       for (const prj of tsProjects) {
         transpileTsProject(prj, {watch: cfg.watch});
       }
     }
 
+    // 执行 JS 打包（rollup）
     bundleJs('rollup.config.js');
+    // 生成 ServiceWorker 清单
     genServiceWorkerManifestJson();
 
-    // Watches the /dist. When changed:
-    // - Notifies the HTTP live reload clients.
-    // - Regenerates the ServiceWorker file map.
+    // 监听 dist 目录变化：触发热重载 + 重新生成 ServiceWorker 清单
     scanDir(cfg.outDistRootDir);
   }
 
-  // We should enter the loop only in watch mode, where tsc and rollup are
-  // asynchronous because they run in watch mode.
+  // 6. 等待首次构建完成（--no-build 但产物不全时提示）
   if (args.no_build && !isDistComplete()) {
     console.log('No build was requested, but artifacts are not available.');
     console.log('In case of execution error, re-run without --no-build.');
@@ -315,32 +356,40 @@ async function main() {
   }
   if (cfg.watch) console.log('\nFirst build completed!');
 
+  // 7. 启动 HTTP 开发服务器（若指定）
   if (cfg.startHttpServer) {
     startServer();
   }
+  // 8. 运行单元测试（若指定）
   if (args.run_unittests) {
     runTests('jest.unittest.config.js');
   }
 }
 
 // -----------
-// Build rules
+// 构建规则（核心任务实现）
 // -----------
 
+/**
+ * 运行 Jest 单元测试
+ * @param {string} cfgFile - Jest 配置文件路径（相对 ui/config 目录）
+ */
 function runTests(cfgFile) {
   const args = [
     '--rootDir',
-    cfg.outTscDir,
-    '--verbose',
-    '--runInBand',
-    '--detectOpenHandles',
-    '--forceExit',
+    cfg.outTscDir, // 测试根目录（TS 编译产物）
+    '--verbose', // 详细日志
+    '--runInBand', // 串行执行测试（避免并行问题）
+    '--detectOpenHandles', // 检测未关闭的句柄
+    '--forceExit', // 强制退出（即使有异步任务）
     '--projects',
-    pjoin(ROOT_DIR, 'ui/config', cfgFile),
+    pjoin(ROOT_DIR, 'ui/config', cfgFile), // 配置文件路径
   ];
+  // 测试过滤（指定正则）
   if (cfg.testFilter.length > 0) {
     args.push('-t', cfg.testFilter);
   }
+  // watch 模式：监听测试文件变化
   if (cfg.watch) {
     args.push('--watchAll');
     addTask(execModule, ['jest', args, {async: true}]);
@@ -349,68 +398,106 @@ function runTests(cfgFile) {
   }
 }
 
+/**
+ * 复制并处理 HTML 文件（注入版本信息）
+ * 1. 原样复制到带版本号的 dist 目录（归档用）
+ * 2. 注入版本映射到根 dist 目录的 HTML（用于自动更新逻辑）
+ * @param {string} src - 源 HTML 文件路径
+ * @param {string} filename - 输出文件名
+ */
 function cpHtml(src, filename) {
   let html = fs.readFileSync(src).toString();
-  // First copy the html as-is into the dist/v1.2.3/ directory. This is
-  // only used for archival purporses, so one can open
-  // ui.perfetto.dev/v1.2.3/ to skip the auto-update and channel logic.
+  // 1. 归档版本：原样复制到 dist/v1.2.3/
   fs.writeFileSync(pjoin(cfg.outDistDir, filename), html);
 
-  // Then copy it into the dist/ root by patching the version code.
-  // TODO(primiano): in next CLs, this script should take a
-  // --release_map=xxx.json argument, to populate this with multiple channels.
+  // 2. 根版本：注入版本映射（当前仅 stable 通道）
+  // TODO: 后续支持 --release_map=xxx.json 参数，适配多通道版本
   const versionMap = JSON.stringify({'stable': cfg.version});
   const bodyRegex = /data-perfetto_version='[^']*'/;
   html = html.replace(bodyRegex, `data-perfetto_version='${versionMap}'`);
   fs.writeFileSync(pjoin(cfg.outDistRootDir, filename), html);
 }
 
+/**
+ * 复制主页面 index.html（入队任务）
+ * @param {string} src - 源文件路径
+ */
 function copyIndexHtml(src) {
   addTask(cpHtml, [src, 'index.html']);
 }
 
+/**
+ * 复制 bigtrace 页面 HTML（入队任务，仅 bigtrace 模式）
+ * @param {string} src - 源文件路径
+ */
 function copyBigtraceHtml(src) {
   if (cfg.bigtrace) {
     addTask(cpHtml, [src, 'bigtrace.html']);
   }
 }
 
+/**
+ * 复制 open_perfetto_trace 页面 HTML（入队任务，仅对应模式）
+ * @param {string} src - 源文件路径
+ */
 function copyOpenPerfettoTraceHtml(src) {
   if (cfg.openPerfettoTrace) {
     addTask(cp, [src, pjoin(cfg.outOpenPerfettoTraceDistDir, 'index.html')]);
   }
 }
 
+/**
+ * 复制静态资源（PNG/字体等，入队任务）
+ * @param {string} src - 源文件路径
+ * @param {string} dst - 目标相对路径
+ */
 function copyAssets(src, dst) {
   addTask(cp, [src, pjoin(cfg.outDistDir, 'assets', dst)]);
+  // bigtrace 模式：同步复制到 bigtrace 资源目录
   if (cfg.bigtrace) {
     addTask(cp, [src, pjoin(cfg.outBigtraceDistDir, 'assets', dst)]);
   }
 }
 
+/**
+ * 复制 UI 测试静态资源（入队任务）
+ * @param {string} src - 源文件路径
+ * @param {string} dst - 目标相对路径
+ */
 function copyUiTestArtifactsAssets(src, dst) {
   addTask(cp, [src, pjoin(cfg.outUiTestArtifactsDir, dst)]);
 }
 
+/**
+ * 编译 SCSS 为 CSS（入队任务）
+ * 核心逻辑：调用 sass 模块编译 perfetto.scss 为 perfetto.css
+ */
 function compileScss() {
   const src = pjoin(ROOT_DIR, 'ui/src/assets/perfetto.scss');
   const dst = pjoin(cfg.outDistDir, 'perfetto.css');
-  // In watch mode, don't exit(1) if scss fails. It can easily happen by
-  // having a typo in the css. It will still print an error.
+  // watch 模式下：SCSS 编译失败不退出（允许临时语法错误）
   const noErrCheck = !!cfg.watch;
   const args = [src, dst];
   if (!cfg.verbose) {
-    args.unshift('--quiet');
+    args.unshift('--quiet'); // 非详细模式：静默输出
   }
   addTask(execModule, ['sass', args, {noErrCheck}]);
+  // bigtrace 模式：同步复制 CSS 到 bigtrace 目录
   if (cfg.bigtrace) {
     addTask(cp, [dst, pjoin(cfg.outBigtraceDistDir, 'perfetto.css')]);
   }
 }
 
+/**
+ * 编译 Proto 文件为 TS/JS（入队任务）
+ * 流程：
+ * 1. pbjs 编译 proto 为 CommonJS 模块的 JS 文件
+ * 2. pbts 从 JS 文件生成 TS 类型声明
+ */
 function compileProtos() {
   const dstJs = pjoin(cfg.outGenDir, 'protos.js');
   const dstTs = pjoin(cfg.outGenDir, 'protos.d.ts');
+  // 需要编译的 Proto 文件列表
   const inputs = [
     'protos/perfetto/ipc/consumer_port.proto',
     'protos/perfetto/ipc/wire_protocol.proto',
@@ -418,46 +505,42 @@ function compileProtos() {
     'protos/perfetto/perfetto_sql/structured_query.proto',
     'protos/perfetto/trace_processor/trace_processor.proto',
   ];
-  // Can't put --no-comments here - The comments are load bearing for
-  // the pbts invocation which follows.
+  // pbjs 编译参数（保留注释，供 pbts 使用）
   const pbjsArgs = [
-    '--no-beautify',
-    '--force-number',
-    '--no-delimited',
-    '--no-verify',
-    '-t',
-    'static-module',
-    '-w',
-    'commonjs',
-    '-p',
-    ROOT_DIR,
-    '-o',
-    dstJs,
+    '--no-beautify', // 不格式化输出
+    '--force-number', // 强制数字类型（避免大数问题）
+    '--no-delimited', // 禁用分隔符格式
+    '--no-verify', // 不验证输出
+    '-t', 'static-module', // 输出静态模块
+    '-w', 'commonjs', // 模块格式：CommonJS
+    '-p', ROOT_DIR, // Proto 导入路径
+    '-o', dstJs, // 输出 JS 文件
   ].concat(inputs);
   addTask(execModule, ['pbjs', pbjsArgs]);
 
-  // Note: If you are looking into slowness of pbts it is not pbts
-  // itself that is slow. It invokes jsdoc to parse the comments out of
-  // the |dstJs| with https://github.com/hegemonic/catharsis which is
-  // pinning a CPU core the whole time.
+  // pbts 生成 TS 类型声明（注意：pbts 本身不慢，慢的是内部调用的 jsdoc/catharsis）
   const pbtsArgs = ['--no-comments', '-p', ROOT_DIR, '-o', dstTs, dstJs];
   addTask(execModule, ['pbts', pbtsArgs]);
 }
 
+/**
+ * 生成插件导入文件（入队任务）
+ * 作用：自动生成导入所有插件的 TS 文件，避免手动维护导入列表
+ * @param {string} dir - 插件目录（相对仓库根）
+ * @param {string} name - 输出文件名（无后缀，自动加 .ts）
+ */
 function generateImports(dir, name) {
-  // We have to use the symlink (ui/src/gen) rather than cfg.outGenDir
-  // below since we want to generate the correct relative imports. For example:
-  // ui/src/frontend/foo.ts
-  //    import '../gen/all_plugins.ts';
-  // ui/src/gen/all_plugins.ts (aka ui/out/tsc/gen/all_plugins.ts)
-  //    import '../frontend/some_plugin.ts';
+  // 注意：使用符号链接 ui/src/gen 而非 cfg.outGenDir，保证相对导入路径正确
   const dstTs = pjoin(ROOT_DIR, 'ui/src/gen', name);
   const inputDir = pjoin(ROOT_DIR, dir);
   const args = [GEN_IMPORTS_SCRIPT, inputDir, '--out', dstTs];
   addTask(exec, ['python3', args]);
 }
 
-// Generates a .ts source that defines the VERSION and SCM_REVISION constants.
+/**
+ * 生成版本信息 TS 文件（入队任务）
+ * 作用：输出 VERSION 和 SCM_REVISION 常量到 TS 文件，供 UI 使用
+ */
 function genVersion() {
   const cmd = 'python3';
   const args =
@@ -465,65 +548,88 @@ function genVersion() {
   addTask(exec, [cmd, args]);
 }
 
+/**
+ * 生成 Perfetto SQL 标准库文档（JSON 格式，入队任务）
+ */
 function generateStdlibDocs() {
   const cmd = pjoin(ROOT_DIR, 'tools/gen_stdlib_docs_json.py');
   const stdlibDir = pjoin(ROOT_DIR, 'src/trace_processor/perfetto_sql/stdlib');
 
+  // 遍历标准库目录，筛选 .sql 文件
   const stdlibFiles =
     listFilesRecursive(stdlibDir)
     .filter((filePath) => path.extname(filePath) === '.sql');
 
+  // 入队生成任务（输出压缩后的 JSON）
   addTask(exec, [
     cmd,
     [
       '--json-out',
       pjoin(cfg.outDistDir, 'stdlib_docs.json'),
-      '--minify',
+      '--minify', // 压缩 JSON
       ...stdlibFiles,
     ],
   ]);
 }
 
+/**
+ * 更新构建相关符号链接
+ * 作用：
+ * 1. ui/out -> out/xxx/ui（简化路径引用）
+ * 2. ui/src/gen -> out/ui/tsc/gen（TS 导入路径兼容）
+ * 3. out/ui/test/data -> test/data（测试资源引用）
+ * 4. out/ui/dist_version -> out/ui/dist/v1.2.3（rollup 无需感知版本号）
+ * 5. out/ui/tsc/node_modules -> ui/node_modules（模块解析）
+ */
 function updateSymlinks() {
-  // /ui/out -> /out/ui.
+  // /ui/out -> /out/ui
   mklink(cfg.outUiDir, pjoin(ROOT_DIR, 'ui/out'));
 
-  // /ui/src/gen -> /out/ui/ui/tsc/gen)
+  // /ui/src/gen -> /out/ui/ui/tsc/gen
   mklink(cfg.outGenDir, pjoin(ROOT_DIR, 'ui/src/gen'));
 
-  // /out/ui/test/data -> /test/data (For UI tests).
+  // /out/ui/test/data -> /test/data（UI 测试资源）
   mklink(
       pjoin(ROOT_DIR, 'test/data'),
       pjoin(ensureDir(pjoin(cfg.outDir, 'test')), 'data'));
 
-  // Creates a out/dist_version -> out/dist/v1.2.3 symlink, so rollup config
-  // can point to that without having to know the current version number.
+  // out/dist_version -> out/dist/v1.2.3（版本无关路径）
   mklink(
       path.relative(cfg.outUiDir, cfg.outDistDir),
       pjoin(cfg.outUiDir, 'dist_version'));
 
+  // out/ui/tsc/node_modules -> ui/node_modules（TS 编译时模块解析）
   mklink(
       pjoin(ROOT_DIR, 'ui/node_modules'), pjoin(cfg.outTscDir, 'node_modules'));
 }
 
-// Invokes ninja for building the {trace_processor, traceconv} Wasm modules.
-// It copies the .wasm directly into the out/dist/ dir, and the .js/.ts into
-// out/tsc/, so the typescript compiler and the bundler can pick them up.
+/**
+ * 构建 Wasm 模块（入队任务）
+ * 流程：
+ * 1. 生成 GN 构建参数（debug/ccache 等）
+ * 2. 调用 ninja 构建指定的 Wasm 模块
+ * 3. 复制 Wasm 产物到对应目录（dist 放 .wasm，tsc 放 .js/.d.ts）
+ * @param {boolean} skipWasmBuild - 是否跳过 Wasm 构建
+ */
 function buildWasm(skipWasmBuild) {
   if (!skipWasmBuild) {
+    // 生成 GN 构建参数（非 noOverrideGnArgs 模式）
     if (!cfg.noOverrideGnArgs) {
       let gnVars = `is_debug=${cfg.debug}`;
+      // 检测 ccache 并启用（加速编译）
       if (childProcess.spawnSync('which', ['ccache']).status === 0) {
         gnVars += ` cc_wrapper="ccache"`;
       }
       const gnArgs = ['gen', `--args=${gnVars}`, cfg.outDir];
       addTask(exec, [pjoin(ROOT_DIR, 'tools/gn'), gnArgs]);
     }
+    // 调用 ninja 构建 Wasm 模块
     const ninjaArgs = ['-C', cfg.outDir];
     ninjaArgs.push(...cfg.wasmModules.map((x) => `${x}_wasm`));
     addTask(exec, [pjoin(ROOT_DIR, 'tools/ninja'), ninjaArgs]);
   }
 
+  // 复制 Wasm 产物到对应目录
   for (const wasmMod of cfg.wasmModules) {
     const isMem64 = wasmMod.endsWith('_memory64');
     const wasmOutDir = pjoin(cfg.outDir, isMem64 ? 'wasm_memory64' : 'wasm');
